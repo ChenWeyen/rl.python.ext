@@ -16,6 +16,8 @@ import omni.usd
 import omni.kit.actions.core
 import omni.kit.menu.utils
 import omni.appwindow
+import socket
+import threading
 
 import carb
 import carb.input
@@ -105,6 +107,14 @@ class MyExtension(omni.ext.IExt):
         self._input = None
         self._keyboard = None
         self._keyboard_sub_id = None
+        self._udp_port_field = None
+        self._udp_status_label = None
+        self._udp_count_label = None
+        self._udp_packets = 0
+        self._udp_running = False
+        self._udp_socket = None
+        self._udp_thread = None
+        self._udp_stop_event = threading.Event()
         self._window = ui.Window(
             "RL Python UI Extension", width=300, height=300
         )
@@ -155,7 +165,124 @@ class MyExtension(omni.ext.IExt):
                     ui.Button("raycast V3", clicked_fn=on_click)
                     ui.Button("Reset", clicked_fn=on_reset)
 
+                ui.Spacer(height=8)
+                ui.Label("UDP Listener")
+
+                with ui.HStack(height=20):
+                    ui.Label("Port", width=40)
+                    self._udp_port_field = ui.StringField(height=20)
+                    self._udp_port_field.model.set_value("5005")
+
+                self._udp_status_label = ui.Label("UDP listener stopped")
+                self._udp_count_label = ui.Label("UDP packets received: 0")
+
+                self._udp_toggle_model = ui.SimpleBoolModel(False)
+                self._udp_toggle_model.add_value_changed_fn(self._on_udp_toggle)
+                with ui.HStack(height=20):
+                    ui.CheckBox(model=self._udp_toggle_model, width=20)
+                    ui.Label("Listen on UDP port")
+
         self._subscribe_keyboard_events()
+
+    def _on_udp_toggle(self, model):
+        """Start or stop UDP listener when the checkbox state changes."""
+        enabled = model.get_value_as_bool()
+        if enabled:
+            self._start_udp_listener()
+        else:
+            self._stop_udp_listener()
+
+    def _start_udp_listener(self):
+        """Start a UDP listener thread using the configured port."""
+        if self._udp_running:
+            return
+
+        port_text = self._udp_port_field.model.get_value_as_string().strip() if self._udp_port_field else ""
+        try:
+            port = int(port_text)
+            if port < 1 or port > 65535:
+                raise ValueError("port out of range")
+        except Exception:
+            self._set_udp_status("Invalid UDP port. Enter 1-65535.")
+            if hasattr(self, "_udp_toggle_model"):
+                self._udp_toggle_model.set_value(False)
+            return
+
+        self._udp_packets = 0
+        self._set_udp_count(self._udp_packets)
+        self._udp_stop_event.clear()
+
+        try:
+            self._udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._udp_socket.bind(("0.0.0.0", port))
+            self._udp_socket.settimeout(0.2)
+        except Exception as exc:
+            self._set_udp_status(f"Failed to listen on UDP {port}: {exc}")
+            self._close_udp_socket()
+            if hasattr(self, "_udp_toggle_model"):
+                self._udp_toggle_model.set_value(False)
+            return
+
+        self._udp_running = True
+        self._set_udp_status(f"Listening on UDP port {port}")
+        self._udp_thread = threading.Thread(target=self._udp_receive_loop, name="rl.python_ui_ext.udp", daemon=True)
+        self._udp_thread.start()
+
+    def _udp_receive_loop(self):
+        """Background worker that receives UDP packets and updates packet count."""
+        while not self._udp_stop_event.is_set() and self._udp_socket is not None:
+            try:
+                data, addr = self._udp_socket.recvfrom(65535)
+                self._udp_packets += 1
+                count = self._udp_packets
+                endpoint = f"{addr[0]}:{addr[1]}"
+                carb.log_info(f"[rl.python_ui_ext] UDP packet #{count} ({len(data)} bytes) from {endpoint}")
+                _run_on_next_post_update(lambda c=count: self._set_udp_count(c))
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            except Exception as exc:
+                carb.log_warn(f"[rl.python_ui_ext] UDP listener error: {exc}")
+                break
+
+        _run_on_next_post_update(lambda: self._set_udp_status("UDP listener stopped"))
+        self._udp_running = False
+
+    def _stop_udp_listener(self):
+        """Stop the UDP listener thread and release socket resources."""
+        if not self._udp_running and self._udp_socket is None:
+            self._set_udp_status("UDP listener stopped")
+            return
+
+        self._udp_stop_event.set()
+        self._close_udp_socket()
+
+        thread = self._udp_thread
+        self._udp_thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+
+        self._udp_running = False
+        self._set_udp_status("UDP listener stopped")
+
+    def _close_udp_socket(self):
+        if self._udp_socket is not None:
+            try:
+                self._udp_socket.close()
+            except Exception:
+                carb.log_exception("[rl.python_ui_ext] Failed to close UDP socket")
+            finally:
+                self._udp_socket = None
+
+    def _set_udp_status(self, text):
+        carb.log_info(f"[rl.python_ui_ext] {text}")
+        if self._udp_status_label is not None:
+            self._udp_status_label.text = text
+
+    def _set_udp_count(self, count):
+        if self._udp_count_label is not None:
+            self._udp_count_label.text = f"UDP packets received: {count}"
 
     def _subscribe_keyboard_events(self):
         """Subscribe to global keyboard events and print them to the UI."""
@@ -194,6 +321,7 @@ class MyExtension(omni.ext.IExt):
     def on_shutdown(self):
         """This is called every time the extension is deactivated. It is used
         to clean up the extension state."""
+        self._stop_udp_listener()
         try:
             if self._input is not None and self._keyboard is not None and self._keyboard_sub_id is not None:
                 self._input.unsubscribe_to_keyboard_events(self._keyboard, self._keyboard_sub_id)
